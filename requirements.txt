@@ -1,0 +1,5 @@
+python-telegram-bot==13.15
+google-api-python-client==2.126.0
+twitchio==2.9.1
+aiohttp
+python-dotenv
