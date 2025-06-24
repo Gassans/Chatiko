@@ -1,5 +1,8 @@
-python-telegram-bot==20.3
 nest_asyncio
 urllib3>=1.26.0
 flask
 twitchio
+python-telegram-bot==20.7
+apscheduler==3.10.4
+google-api-python-client==2.121.0
+python-dotenv==1.0.1
