@@ -1,4 +1,5 @@
 python-telegram-bot==20.3
+nest_asyncio
 urllib3>=1.26.0
 flask
 twitchio
