@@ -57,12 +57,16 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             auto_stop_task.schedule_removal()
             auto_stop_task = None
 
+async def post_init(application):
+    print("✅ Job queue инициализирована")
+
 async def main():
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
     await app.run_polling()
+
 
 if __name__ == '__main__':
     keep_alive()
