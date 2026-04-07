@@ -84,7 +84,7 @@ async def youtube_bot_loop():
                             seen_users.add(author_id)
 
                             # используем имя напрямую (без API!)
-                            user_name = c.author.name
+                            user_name = c.author.name.lstrip('@').strip()
 
                             await send_message(f"Новый котэк на Ютубе❤️: {user_name}")
 
