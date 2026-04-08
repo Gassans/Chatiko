@@ -3,13 +3,10 @@ import asyncio
 import logging
 import pytchat
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from telegram import Bot
 
-# Логирование
 logging.basicConfig(level=logging.INFO)
 
-# Переменные окружения
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
@@ -30,14 +27,34 @@ async def get_live_video_id(youtube, channel_id):
         request = youtube.search().list(
             part='id',
             channelId=channel_id,
-            eventType='live',
-            type='video'
+            type='video',
+            order='date',
+            maxResults=5
         )
         response = request.execute()
-        if response['items']:
-            return response['items'][0]['id']['videoId']
-    except HttpError as e:
-        logging.error(f"Ошибка YouTube API при получении live video: {e}")
+
+        for item in response['items']:
+            video_id = item['id']['videoId']
+
+            video_request = youtube.videos().list(
+                part='liveStreamingDetails',
+                id=video_id
+            )
+            video_response = video_request.execute()
+
+            if not video_response['items']:
+                continue
+
+            details = video_response['items'][0].get('liveStreamingDetails', {})
+
+            # если стрим уже начался и не закончился
+            if 'actualStartTime' in details and 'actualEndTime' not in details:
+                logging.info(f"Найден live стрим: {video_id}")
+                return video_id
+
+    except Exception as e:
+        logging.error(f"Ошибка получения live video: {e}")
+
     return None
 
 
@@ -50,18 +67,16 @@ async def youtube_bot_loop():
             video_id = await get_live_video_id(youtube, YOUTUBE_CHANNEL_ID)
 
             if not video_id:
-                logging.info("Стрим не найден. Следующая проверка через 5 минут.")
-                await asyncio.sleep(300)
+                logging.info("Стрим не найден. Проверка через 2 минуты.")
+                await asyncio.sleep(120)
                 continue
 
-            logging.info(f"Подключение к YouTube чату видео: {video_id}")
+            logging.info(f"Подключение к чату: {video_id}")
 
-            # небольшая задержка (важно для стабильности pytchat)
             await asyncio.sleep(5)
 
-            # retry подключения к чату
             chat = None
-            for _ in range(3):
+            for _ in range(5):
                 try:
                     chat = pytchat.create(video_id=video_id)
                     break
@@ -74,7 +89,6 @@ async def youtube_bot_loop():
                 await asyncio.sleep(60)
                 continue
 
-            # читаем чат
             while chat.is_alive():
                 try:
                     for c in chat.get().sync_items():
@@ -82,23 +96,20 @@ async def youtube_bot_loop():
 
                         if author_id not in seen_users:
                             seen_users.add(author_id)
-
-                            # используем имя напрямую (без API!)
                             user_name = c.author.name.lstrip('@').strip()
-
                             await send_message(f"Новый котэк на Ютубе❤️: {user_name}")
 
                     await asyncio.sleep(1)
 
                 except Exception as e:
-                    logging.error(f"Ошибка в чтении чата: {e}")
+                    logging.error(f"Ошибка чтения чата: {e}")
                     await asyncio.sleep(5)
 
-            logging.info("Чат завершен. Проверка нового стрима через 1 минуту.")
+            logging.info("Чат завершён. Повторная проверка через 1 минуту.")
             await asyncio.sleep(60)
 
         except Exception as e:
-            logging.error(f"Глобальная ошибка цикла: {e}")
+            logging.error(f"Глобальная ошибка: {e}")
             await asyncio.sleep(60)
 
 
