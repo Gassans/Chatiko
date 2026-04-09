@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import aiohttp
-import re
+import json
 from googleapiclient.discovery import build
 from telegram import Bot
 
@@ -17,175 +17,195 @@ YOUTUBE_CHANNEL_ID = os.environ["YOUTUBE_CHANNEL_ID"]
 bot = Bot(token=TELEGRAM_TOKEN)
 
 
+# ------------------ TELEGRAM ------------------
 async def send_message(text):
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
     except Exception as e:
-        logger.error(f"Ошибка Telegram: {e}")
+        logger.error(f"Telegram error: {e}")
 
 
-# 🔍 ищем стрим (редко)
-async def get_live_chat_id(youtube):
+# ------------------ YOUTUBE API ------------------
+async def get_video_and_chat(youtube):
     try:
-        search = youtube.search().list(
-            part='id',
+        # live + upcoming (премьеры тоже тут)
+        req = youtube.search().list(
+            part="id",
             channelId=YOUTUBE_CHANNEL_ID,
-            eventType='live',
-            type='video',
+            type="video",
+            eventType="live",
             maxResults=1
         ).execute()
 
-        if not search.get('items'):
+        video_id = None
+
+        if req.get("items"):
+            video_id = req["items"][0]["id"]["videoId"]
+
+        # fallback: upcoming (премьеры)
+        if not video_id:
+            req2 = youtube.search().list(
+                part="id",
+                channelId=YOUTUBE_CHANNEL_ID,
+                type="video",
+                eventType="upcoming",
+                maxResults=1
+            ).execute()
+
+            if req2.get("items"):
+                video_id = req2["items"][0]["id"]["videoId"]
+
+        if not video_id:
             return None, None
 
-        video_id = search['items'][0]['id']['videoId']
-
+        # получаем liveChatId
         details = youtube.videos().list(
-            part='liveStreamingDetails',
+            part="liveStreamingDetails",
             id=video_id
         ).execute()
 
-        items = details.get('items')
+        items = details.get("items", [])
         if not items:
             return video_id, None
 
-        chat_id = items[0].get('liveStreamingDetails', {}).get('activeLiveChatId')
+        chat_id = items[0].get("liveStreamingDetails", {}).get("activeLiveChatId")
 
         return video_id, chat_id
 
     except Exception as e:
-        logger.error(f"Ошибка API: {e}")
+        logger.error(f"YouTube API error: {e}")
         return None, None
 
 
-
-async def get_initial_continuation(video_id):
-    url = f"https://www.youtube.com/watch?v={video_id}"
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            html = await resp.text()
-
-    match = re.search(r'"continuation":"(.*?)"', html)
-
-    if match:
-        return match.group(1)
-
-    return None
-
-
-
-async def chat_loop(continuation, seen_users):
+# ------------------ CHAT WORKER ------------------
+async def chat_worker(live_chat_id, seen_users):
     url = "https://www.youtube.com/youtubei/v1/live_chat/get_live_chat"
+    headers = {"Content-Type": "application/json"}
 
-    headers = {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    is_first_batch = True  
+    continuation = None
+    is_first = True
 
     async with aiohttp.ClientSession() as session:
+
+        # 🔥 получаем стартовую continuation
+        init_payload = {
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20210721"
+                }
+            },
+            "continuation": live_chat_id
+        }
+
+        async with session.post(url, json=init_payload, headers=headers) as r:
+            data = await r.json()
+
+        continuations = data.get("continuationContents", {}) \
+                            .get("liveChatContinuation", {}) \
+                            .get("continuations", [])
+
+        if continuations:
+            continuation = continuations[0].get("invalidationContinuationData", {}).get("continuation")
+
+        if not continuation:
+            raise Exception("No continuation yet (premiere not ready)")
+
+        logger.info("Chat connected")
+
         while True:
             try:
                 payload = {
                     "context": {
                         "client": {
                             "clientName": "WEB",
-                            "clientVersion": "2.20210721.00.00"
+                            "clientVersion": "2.20210721"
                         }
                     },
                     "continuation": continuation
                 }
 
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    data = await resp.json()
+                async with session.post(url, json=payload, headers=headers) as r:
+                    data = await r.json()
 
                 actions = data.get("continuationContents", {}) \
                               .get("liveChatContinuation", {}) \
                               .get("actions", [])
 
-                
-                if is_first_batch:
-                    logger.info("Пропускаем старые сообщения...")
-                    is_first_batch = False
+                # 🔥 ПРОПУСК ИСТОРИИ
+                if is_first:
+                    is_first = False
                 else:
                     for action in actions:
-                        item = action.get("addChatItemAction", {}).get("item", {})
-                        message = item.get("liveChatTextMessageRenderer")
+                        msg = action.get("addChatItemAction", {}).get("item", {}) \
+                                    .get("liveChatTextMessageRenderer")
 
-                        if not message:
+                        if not msg:
                             continue
 
-                        author_id = message.get("authorExternalChannelId")
-                        if not author_id:
-                            continue
+                        author_id = msg.get("authorExternalChannelId")
 
-                        if author_id not in seen_users:
+                        if author_id and author_id not in seen_users:
                             seen_users.add(author_id)
 
-                            name = message.get("authorName", {}).get("simpleText", "User")
-                            name = name.lstrip('@').strip()
+                            name = msg.get("authorName", {}).get("simpleText", "User")
 
-                            await send_message(f"Новый котэк на Ютубе❤️: {name}")
+                            await send_message(f"Новый котэк ❤️: {name}")
 
-                
-                continuations = data.get("continuationContents", {}) \
-                                    .get("liveChatContinuation", {}) \
-                                    .get("continuations", [])
+                # 🔁 обновляем continuation
+                conts = data.get("continuationContents", {}) \
+                            .get("liveChatContinuation", {}) \
+                            .get("continuations", [])
 
-                if continuations:
-                    continuation = continuations[0] \
-                        .get("invalidationContinuationData", {}) \
-                        .get("continuation") or \
-                        continuations[0] \
-                        .get("timedContinuationData", {}) \
-                        .get("continuation")
+                if conts:
+                    continuation = (
+                        conts[0].get("invalidationContinuationData", {}).get("continuation")
+                        or conts[0].get("timedContinuationData", {}).get("continuation")
+                    )
 
-                await asyncio.sleep(2)  # ⚡ быстро
+                await asyncio.sleep(2)
 
             except Exception as e:
-                logger.error(f"Ошибка chat_loop: {e}")
-                await asyncio.sleep(5)
+                logger.error(f"Chat error: {e}")
+                await asyncio.sleep(3)
 
 
-
+# ------------------ MAIN LOOP ------------------
 async def main():
-    youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY, static_discovery=False)
+    youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY, static_discovery=False)
 
     seen_users = set()
-    current_video_id = None
+    current_video = None
 
     while True:
         try:
-            video_id, chat_id = await get_live_chat_id(youtube)
+            video_id, chat_id = await get_video_and_chat(youtube)
 
-            if not video_id or not chat_id:
-                logger.info("Стрим не найден. Ждём 5 минут...")
+            if not video_id:
+                logger.info("No stream/premiere. Sleep 5 min")
                 await asyncio.sleep(300)
                 continue
 
-            
-            if video_id != current_video_id:
-                logger.info("Новый стрим → очищаем список пользователей")
+            # 🔥 обновление стрима
+            if video_id != current_video:
+                logger.info("New stream detected")
                 seen_users.clear()
-                current_video_id = video_id
+                current_video = video_id
 
-            logger.info(f"Стрим найден: {video_id}")
+            logger.info(f"Video: {video_id}")
 
-            continuation = await get_initial_continuation(video_id)
-
-            if not continuation:
-                logger.error("Не удалось получить continuation")
-                await asyncio.sleep(60)
+            # ⚠️ если премьера ещё не активировала чат
+            if not chat_id:
+                logger.info("Chat not ready yet (premiere). retry in 20 sec")
+                await asyncio.sleep(20)
                 continue
 
-            logger.info("Подключились к чату через youtubei 🔥")
+            logger.info("Chat ready, connecting...")
 
-            await chat_loop(continuation, seen_users)
+            await chat_worker(chat_id, seen_users)
 
         except Exception as e:
-            logger.error(f"Глобальная ошибка: {e}")
+            logger.error(f"Main error: {e}")
             await asyncio.sleep(60)
 
 
