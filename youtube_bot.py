@@ -30,28 +30,37 @@ async def get_live_chat_id(youtube):
         search = youtube.search().list(
             part='id',
             channelId=YOUTUBE_CHANNEL_ID,
-            eventType='live',
             type='video',
-            maxResults=1
+            order='date',
+            maxResults=5
         ).execute()
 
         if not search.get('items'):
             return None, None
 
-        video_id = search['items'][0]['id']['videoId']
+        video_ids = [
+            item['id']['videoId']
+            for item in search['items']
+            if 'videoId' in item['id']
+        ]
+
+        if not video_ids:
+            return None, None
 
         details = youtube.videos().list(
             part='liveStreamingDetails',
-            id=video_id
+            id=','.join(video_ids)
         ).execute()
 
-        items = details.get('items')
-        if not items:
-            return video_id, None
+        for item in details.get('items', []):
+            live_details = item.get('liveStreamingDetails', {})
+            chat_id = live_details.get('activeLiveChatId')
 
-        chat_id = items[0].get('liveStreamingDetails', {}).get('activeLiveChatId')
+            if chat_id:
+                video_id = item['id']
+                return video_id, chat_id
 
-        return video_id, chat_id
+        return None, None
 
     except Exception as e:
         logger.error(f"Ошибка API: {e}")
@@ -62,17 +71,26 @@ async def get_live_chat_id(youtube):
 async def get_initial_continuation(video_id):
     url = f"https://www.youtube.com/watch?v={video_id}"
 
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
+        async with session.get(url, headers=headers) as resp:
             html = await resp.text()
 
-    match = re.search(r'"continuation":"(.*?)"', html)
-
+    # основной вариант
+    match = re.search(r'"continuation":"([^"]+)"', html)
     if match:
         return match.group(1)
 
-    return None
+    # fallback для премьер
+    match = re.search(r'"reloadContinuationData":\{"continuation":"([^"]+)"', html)
+    if match:
+        return match.group(1)
 
+    logger.error("Не удалось получить continuation")
+    return None
 
 
 async def chat_loop(continuation, seen_users):
@@ -83,7 +101,7 @@ async def chat_loop(continuation, seen_users):
         "User-Agent": "Mozilla/5.0"
     }
 
-    is_first_batch = True 
+    is_first_batch = True
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -105,7 +123,6 @@ async def chat_loop(continuation, seen_users):
                               .get("liveChatContinuation", {}) \
                               .get("actions", [])
 
-                
                 if is_first_batch:
                     logger.info("Пропускаем старые сообщения...")
                     is_first_batch = False
@@ -129,7 +146,6 @@ async def chat_loop(continuation, seen_users):
 
                             await send_message(f"Новый котэк на Ютубе❤️: {name}")
 
-                
                 continuations = data.get("continuationContents", {}) \
                                     .get("liveChatContinuation", {}) \
                                     .get("continuations", [])
@@ -142,12 +158,11 @@ async def chat_loop(continuation, seen_users):
                         .get("timedContinuationData", {}) \
                         .get("continuation")
 
-                await asyncio.sleep(2)  # ⚡ быстро
+                await asyncio.sleep(2)
 
             except Exception as e:
                 logger.error(f"Ошибка chat_loop: {e}")
                 await asyncio.sleep(5)
-
 
 
 async def main():
@@ -161,22 +176,20 @@ async def main():
             video_id, chat_id = await get_live_chat_id(youtube)
 
             if not video_id or not chat_id:
-                logger.info("Стрим не найден. Ждём 5 минут...")
+                logger.info("Стрим/премьера не найдены. Ждём 5 минут...")
                 await asyncio.sleep(300)
                 continue
 
-            
             if video_id != current_video_id:
-                logger.info("Новый стрим → очищаем список пользователей")
+                logger.info("Новый стрим или премьера → очищаем список пользователей")
                 seen_users.clear()
                 current_video_id = video_id
 
-            logger.info(f"Стрим найден: {video_id}")
+            logger.info(f"Подключаемся к видео: {video_id}")
 
             continuation = await get_initial_continuation(video_id)
 
             if not continuation:
-                logger.error("Не удалось получить continuation")
                 await asyncio.sleep(60)
                 continue
 
